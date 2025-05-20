@@ -86,7 +86,7 @@ fn handle_message(message: Message, state: State) -> actor.Next(Message, State) 
     }
     ConnectNode(reply, node) -> {
       let connect_calls =
-        dict.update(state.connect_calls, node, fn(maybe_count) {
+        dict.upsert(state.connect_calls, node, fn(maybe_count) {
           option.unwrap(maybe_count, 0) + 1
         })
       let state = State(..state, connect_calls: connect_calls)
