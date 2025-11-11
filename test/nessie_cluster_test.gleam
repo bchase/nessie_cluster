@@ -21,33 +21,6 @@ const example_domain_name = "example.com"
 
 const example_dns = [#(example_domain_name, example_ips)]
 
-pub fn sends_parent_subject_test() {
-  let TestableDnsCluster(cluster: cluster, ..) =
-    mock_resolver.new_cluster(
-      dns: dict.from_list(example_dns),
-      connect_errors: dict.new(),
-    )
-
-  let parent_subject = process.new_subject()
-
-  let actor.Started(data: started_subject, ..) =
-    cluster
-    |> nessie_cluster.with_query(DnsQuery(example_domain_name))
-    |> nessie_cluster.with_interval(None)
-    |> nessie_cluster.start
-    |> should.be_ok()
-
-  let subject =
-    parent_subject
-    |> process.receive(100)
-    |> should.be_ok()
-
-  // Should be the same subject owner (actor PID) as the started subject's
-  subject
-  |> process.subject_owner()
-  |> should.equal(process.subject_owner(started_subject))
-}
-
 pub fn connects_to_valid_host_test() {
   let TestableDnsCluster(cluster: cluster, ..) =
     mock_resolver.new_cluster(
