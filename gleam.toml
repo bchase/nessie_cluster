@@ -27,7 +27,7 @@ gleam = ">= 1.0.0"
 [dependencies]
 gleam_stdlib = "~> 0.34 or ~> 1.0"
 # nessie = "~> 0.1 or ~> 1.0"
-nessie = { git = "git@github.com:bchase/nessie.git", ref="upgrade-stdlib-dynamic-decode" }
+nessie = { git = "git@github.com:bchase/nessie.git", ref="upgrade-stdlib-removed-dynamic-from" }
 
 gleam_otp = "~> 0.10 or ~> 1.0"
 gleam_erlang = "~> 0.25 or ~> 1.0"

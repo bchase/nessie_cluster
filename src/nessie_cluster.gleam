@@ -9,12 +9,12 @@
 
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/node.{type ConnectError, type Node}
-import gleam/erlang/process.{type Subject, type Timer}
-import gleam/function
+import gleam/erlang/process.{type Subject, type Timer, type Name}
 import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import nessie
@@ -61,7 +61,7 @@ pub type DnsQuery {
 /// use the `with_*` functions to configure it.
 pub opaque type DnsCluster {
   DnsCluster(
-    name: Atom,
+    name: Name(Message),
     query: DnsQuery,
     interval_millis: Option(Int),
     logger: Logger,
@@ -95,7 +95,7 @@ type DnsClusterState {
 /// `with_query`.
 pub fn new() -> DnsCluster {
   DnsCluster(
-    name: atom.create_from_string("nessie_cluster"),
+    name: process.new_name("nessie_cluster"),
     query: Ignore,
     interval_millis: Some(5000),
     logger: default_logger("[nessie_cluster]"),
@@ -106,7 +106,7 @@ pub fn new() -> DnsCluster {
 /// Use a custom name for the process.
 ///
 /// The default `nessie_cluster` name is typically sufficient.
-pub fn with_name(for cluster: DnsCluster, using name: Atom) -> DnsCluster {
+pub fn with_name(for cluster: DnsCluster, using name: Name(Message)) -> DnsCluster {
   DnsCluster(..cluster, name: name)
 }
 
@@ -172,10 +172,10 @@ pub opaque type Message {
 pub fn discover_nodes(
   on subject: Subject(Message),
   timeout_millis timeout: Option(Int),
-) -> Result(#(List(Node), List(NodeConnectError)), process.CallError(_)) {
+) -> Result(#(List(Node), List(NodeConnectError)), Nil) {
   case timeout {
     Some(timeout) ->
-      process.try_call(
+      try_call(
         subject,
         fn(client) { DiscoverNodes(Some(client), True) },
         timeout,
@@ -193,8 +193,20 @@ pub fn discover_nodes(
 pub fn stop(
   subject: Subject(Message),
   timeout: Int,
-) -> Result(Nil, process.CallError(_)) {
-  process.try_call(subject, Stop, timeout)
+) -> Result(Nil, Nil) {
+  try_call(subject, Stop, timeout)
+}
+
+fn try_call(
+  subject: Subject(Message),
+  message: fn(Subject(a)) -> Message,
+  timeout: Int,
+) -> Result(a, Nil) {
+  let client = process.new_subject()
+
+  process.send(subject, message(client))
+
+  process.receive(client, timeout)
 }
 
 /// Returns a boolean indicating whether DNS discovery has
@@ -205,8 +217,15 @@ pub fn stop(
 pub fn has_ran(
   subject: Subject(Message),
   timeout: Int,
-) -> Result(Bool, process.CallError(_)) {
-  process.try_call(subject, HasRan, timeout)
+) -> Result(Bool, Nil) {
+  try_call(subject, HasRan, timeout)
+}
+
+/// Calls `start` from within a `ChildSpecification`
+pub fn supervised(
+  cluster: DnsCluster,
+) -> supervision.ChildSpecification(Subject(Message)) {
+  supervision.worker(fn() { start(cluster) })
 }
 
 /// Starts an actor which will periodically poll DNS for
@@ -215,118 +234,121 @@ pub fn has_ran(
 /// If the cluster's query is `Ignore`, the actor will start
 /// successfully, but will not perform any DNS lookups or
 /// attempt to connect to any nodes.
-pub fn start_spec(
+pub fn start(
   cluster: DnsCluster,
-  parent_subject: Option(Subject(Subject(Message))),
-) -> Result(Subject(Message), actor.StartError) {
-  actor.start_spec(spec(cluster, parent_subject))
+) -> Result(actor.Started(Subject(Message)), actor.StartError) {
+  case init(cluster) {
+    Error(err) ->
+      Error(actor.InitFailed(err))
+
+    Ok(state) ->
+      state
+      |> actor.new
+      |> actor.named(cluster.name)
+      |> actor.on_message(handle_message)
+      |> actor.start
+  }
 }
 
-fn spec(cluster: DnsCluster, parent_subject: Option(Subject(Subject(Message)))) {
-  actor.Spec(
-    init_timeout: 10_000,
-    init: fn() {
-      let basename_result =
-        node.self()
-        |> node.to_atom()
-        |> cluster.resolver.basename()
-      case basename_result {
-        Ok(basename) -> {
-          let _ = process.register(process.self(), cluster.name)
-          let state =
-            DnsClusterState(
-              cluster: cluster,
-              basename: basename,
-              poll_timer: None,
-              self: process.new_subject(),
-              has_ran: False,
-            )
-          case cluster.query, cluster.interval_millis {
-            _, None -> Nil
-            Ignore, _ -> Nil
-            DnsQuery(_), _ ->
-              process.send(state.self, DiscoverNodes(None, False))
-          }
-          option.map(parent_subject, process.send(_, state.self))
-          let selector =
-            process.selecting(
-              process.new_selector(),
+fn init(
+  cluster: DnsCluster,
+) -> Result(DnsClusterState, String) {
+  let basename_result =
+    node.self()
+    |> node.name()
+    |> cluster.resolver.basename()
+
+  case basename_result {
+    Ok(basename) -> {
+      let state =
+        DnsClusterState(
+          cluster: cluster,
+          basename: basename,
+          poll_timer: None,
+          self: process.new_subject(),
+          has_ran: False,
+        )
+
+      case cluster.query, cluster.interval_millis {
+        _, None -> Nil
+        Ignore, _ -> Nil
+        DnsQuery(_), _ ->
+          process.send(state.self, DiscoverNodes(None, False))
+      }
+
+      Ok(state)
+    }
+
+    Error(_) -> Error("Failed to get node basename")
+  }
+}
+
+fn handle_message(state: DnsClusterState, msg: Message) -> actor.Next(DnsClusterState, Message) {
+  case msg, state.cluster.query {
+    Stop(client), _ -> {
+      option.map(state.poll_timer, process.cancel_timer)
+      // let _ = process.unregister(state.cluster.name)
+      process.send(client, Nil)
+      state.cluster.logger("warn", "DNS cluster stopped.")
+      actor.stop()
+    }
+    HasRan(client), _ -> {
+      process.send(client, state.has_ran)
+      actor.continue(state)
+    }
+    DiscoverNodes(maybe_client, manual), DnsQuery(query) -> {
+      let cluster = state.cluster
+
+      let errors =
+        do_discover_nodes(
+          cluster.resolver,
+          cluster.logger,
+          state.basename,
+          query,
+        )
+
+      let state = case cluster.interval_millis, maybe_client, manual {
+        // If there is an available client, send it a response.
+        _, Some(client), _ -> {
+          let connected_nodes = cluster.resolver.list_nodes()
+          actor.send(client, #(connected_nodes, errors))
+          state
+        }
+        // If no client and manual call, skip timer reset
+        _, _, True -> state
+        // If no interval is set, skip timer reset
+        None, _, _ -> state
+        // Finally we are confident this is not a manual invocation AND we have an interval
+        Some(interval_millis), _, _ ->
+          DnsClusterState(
+            ..state,
+            poll_timer: Some(process.send_after(
               state.self,
-              function.identity,
-            )
-          actor.Ready(state: state, selector: selector)
-        }
-        Error(_) -> actor.Failed("Failed to get node basename")
-      }
-    },
-    loop: fn(msg: Message, state: DnsClusterState) {
-      case msg, state.cluster.query {
-        Stop(client), _ -> {
-          option.map(state.poll_timer, process.cancel_timer)
-          let _ = process.unregister(state.cluster.name)
-          process.send(client, Nil)
-          state.cluster.logger("warn", "DNS cluster stopped.")
-          actor.Stop(process.Normal)
-        }
-        HasRan(client), _ -> {
-          process.send(client, state.has_ran)
-          actor.Continue(state: state, selector: None)
-        }
-        DiscoverNodes(maybe_client, manual), DnsQuery(query) -> {
-          let cluster = state.cluster
-
-          let errors =
-            do_discover_nodes(
-              cluster.resolver,
-              cluster.logger,
-              state.basename,
-              query,
-            )
-
-          let state = case cluster.interval_millis, maybe_client, manual {
-            // If there is an available client, send it a response.
-            _, Some(client), _ -> {
-              let connected_nodes = cluster.resolver.list_nodes()
-              actor.send(client, #(connected_nodes, errors))
-              state
-            }
-            // If no client and manual call, skip timer reset
-            _, _, True -> state
-            // If no interval is set, skip timer reset
-            None, _, _ -> state
-            // Finally we are confident this is not a manual invocation AND we have an interval
-            Some(interval_millis), _, _ ->
-              DnsClusterState(
-                ..state,
-                poll_timer: Some(process.send_after(
-                  state.self,
-                  interval_millis,
-                  DiscoverNodes(None, False),
-                )),
-              )
-          }
-
-          let state = DnsClusterState(..state, has_ran: True)
-          actor.Continue(state: state, selector: None)
-        }
-
-        DiscoverNodes(maybe_client, _), Ignore -> {
-          state.cluster.logger(
-            "warn",
-            "DNS cluster is set to ignore, will not discover or connect to nodes.",
+              interval_millis,
+              DiscoverNodes(None, False),
+            )),
           )
-          case maybe_client {
-            Some(client) -> {
-              let nodes = state.cluster.resolver.list_nodes()
-              process.send(client, #(nodes, []))
-            }
-            None -> Nil
-          }
-          actor.Continue(state: state, selector: None)
-        }
       }
-    },
-  )
+
+      let state = DnsClusterState(..state, has_ran: True)
+      actor.continue(state)
+    }
+
+    DiscoverNodes(maybe_client, _), Ignore -> {
+      state.cluster.logger(
+        "warn",
+        "DNS cluster is set to ignore, will not discover or connect to nodes.",
+      )
+      case maybe_client {
+        Some(client) -> {
+          let nodes = state.cluster.resolver.list_nodes()
+          process.send(client, #(nodes, []))
+        }
+        None -> Nil
+      }
+      actor.continue(state)
+    }
+  }
 }
 
 /// Returns the default resolver which will query for A and AAAA
@@ -386,7 +408,7 @@ fn do_discover_nodes(
   query: String,
 ) -> List(NodeConnectError) {
   let node_names =
-    list.map(resolver.list_nodes(), fn(n) { atom.to_string(node.to_atom(n)) })
+    list.map(resolver.list_nodes(), fn(n) { atom.to_string(node.name(n)) })
   let peer_ips = resolver.lookup(query)
 
   let #(_, errors) =
@@ -394,7 +416,7 @@ fn do_discover_nodes(
     |> list.map(fn(ip) { basename <> "@" <> ip })
     |> list.filter(fn(node_name) { !list.contains(node_names, node_name) })
     |> list.map(fn(node_name) {
-      let atom_node_name = atom.create_from_string(node_name)
+      let atom_node_name = atom.create(node_name)
 
       case resolver.connect_node(atom_node_name) {
         Ok(_) -> {

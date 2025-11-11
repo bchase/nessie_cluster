@@ -45,37 +45,37 @@ pub fn new_cluster(
   dns dns_mock: DnsMock,
   connect_errors connect_error_mock: ConnectErrorMock,
 ) -> TestableDnsCluster {
-  let assert Ok(resolver_actor) =
-    actor.start(
-      State(
-        nodes: [],
-        dns_mock: dns_mock,
-        connect_error_mock: connect_error_mock,
-        connect_calls: dict.new(),
-      ),
-      handle_message,
+  let assert Ok(actor.Started(data: resolver_actor, ..)) =
+    State(
+      nodes: [],
+      dns_mock: dns_mock,
+      connect_error_mock: connect_error_mock,
+      connect_calls: dict.new(),
     )
+    |> actor.new
+    |> actor.on_message(handle_message)
+    |> actor.start
 
   let resolver =
     Resolver(
       basename: fn(_) { Ok("mock") },
-      list_nodes: fn() { actor.call(resolver_actor, ListNodes, call_timeout) },
+      list_nodes: fn() { actor.call(resolver_actor, call_timeout, ListNodes) },
       lookup: fn(name: String) {
-        actor.call(resolver_actor, Lookup(_, name), call_timeout)
+        actor.call(resolver_actor, call_timeout, Lookup(_, name))
       },
       connect_node: fn(node: Atom) {
-        actor.call(resolver_actor, ConnectNode(_, node), call_timeout)
+        actor.call(resolver_actor, call_timeout, ConnectNode(_, node))
       },
     )
 
   let cluster = nessie_cluster.with_resolver(nessie_cluster.new(), resolver)
 
   TestableDnsCluster(cluster, fn() {
-    actor.call(resolver_actor, ConnectCalls, call_timeout)
+    actor.call(resolver_actor, call_timeout, ConnectCalls)
   })
 }
 
-fn handle_message(message: Message, state: State) -> actor.Next(Message, State) {
+fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
     Lookup(reply, name) -> {
       state.dns_mock
@@ -112,7 +112,7 @@ fn handle_message(message: Message, state: State) -> actor.Next(Message, State) 
       actor.send(reply, state.connect_calls)
       actor.continue(state)
     }
-    Shutdown -> actor.Stop(process.Normal)
+    Shutdown -> actor.stop()
   }
 }
 

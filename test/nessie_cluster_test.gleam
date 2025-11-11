@@ -4,6 +4,7 @@ import gleam/erlang/node
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/otp/actor
 import gleam/set
 import gleeunit
 import gleeunit/should
@@ -29,11 +30,11 @@ pub fn sends_parent_subject_test() {
 
   let parent_subject = process.new_subject()
 
-  let started_subject =
+  let actor.Started(data: started_subject, ..) =
     cluster
     |> nessie_cluster.with_query(DnsQuery(example_domain_name))
     |> nessie_cluster.with_interval(None)
-    |> nessie_cluster.start_spec(Some(parent_subject))
+    |> nessie_cluster.start
     |> should.be_ok()
 
   let subject =
@@ -54,11 +55,11 @@ pub fn connects_to_valid_host_test() {
       connect_errors: dict.new(),
     )
 
-  let cluster =
+  let actor.Started(data: cluster, ..) =
     cluster
     |> nessie_cluster.with_query(DnsQuery(example_domain_name))
     |> nessie_cluster.with_interval(None)
-    |> nessie_cluster.start_spec(None)
+    |> nessie_cluster.start
     |> should.be_ok()
 
   cluster
@@ -78,17 +79,17 @@ pub fn connects_to_valid_host_test() {
 
   let expected_nodes =
     example_ips
-    |> list.map(fn(ip) { atom.create_from_string("mock@" <> ip) })
+    |> list.map(fn(ip) { atom.create("mock@" <> ip) })
     |> set.from_list()
 
   nodes
-  |> list.map(node.to_atom)
+  |> list.map(node.name)
   |> set.from_list()
   |> should.equal(expected_nodes)
 }
 
 pub fn surfaces_connect_errors_test() {
-  let problem_node = atom.create_from_string("mock@1.2.3.4")
+  let problem_node = atom.create("mock@1.2.3.4")
   let connect_errors =
     dict.from_list([#(problem_node, node.LocalNodeIsNotAlive)])
 
@@ -98,11 +99,11 @@ pub fn surfaces_connect_errors_test() {
       connect_errors: connect_errors,
     )
 
-  let cluster =
+  let actor.Started(data: cluster, ..) =
     cluster
     |> nessie_cluster.with_query(DnsQuery(example_domain_name))
     |> nessie_cluster.with_interval(None)
-    |> nessie_cluster.start_spec(None)
+    |> nessie_cluster.start
     |> should.be_ok()
 
   let #(nodes, errors) =
@@ -121,6 +122,6 @@ pub fn surfaces_connect_errors_test() {
   ])
 
   nodes
-  |> list.map(node.to_atom)
-  |> should.equal([atom.create_from_string("mock@5.6.7.8")])
+  |> list.map(node.name)
+  |> should.equal([atom.create("mock@5.6.7.8")])
 }
